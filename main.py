@@ -62,6 +62,11 @@ EMAIL = os.getenv("EMAIL")
 PASSWORD = os.getenv("PASSWORD")
 TOKENSTORE = os.getenv("GARMINTOKENS") or "~/.garminconnect"
 
+# Garth writes its token files into this directory without creating it
+# first, so make sure it exists before any login/dump attempt - matters most
+# on a fresh Fly.io volume, where the subdirectory has never been created.
+os.makedirs(os.path.expanduser(TOKENSTORE), exist_ok=True)
+
 # Optional shared-secret gate. Unset (the default local/dev setup) means every
 # route below stays exactly as open as it is today - localhost only, no key
 # needed. Set API_KEY before hosting this anywhere reachable off your own
