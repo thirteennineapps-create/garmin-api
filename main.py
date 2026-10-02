@@ -62,10 +62,38 @@ EMAIL = os.getenv("EMAIL")
 PASSWORD = os.getenv("PASSWORD")
 TOKENSTORE = os.getenv("GARMINTOKENS") or "~/.garminconnect"
 
-# Garth writes its token files into this directory without creating it
-# first, so make sure it exists before any login/dump attempt - matters most
-# on a fresh Fly.io volume, where the subdirectory has never been created.
+# Belt-and-suspenders: garth.dump() already creates this directory itself,
+# but make sure it exists up front too.
 os.makedirs(os.path.expanduser(TOKENSTORE), exist_ok=True)
+
+
+def _fresh_login(garmin: "Garmin") -> None:
+    """Force a real Garmin SSO login with the email/password already set on
+    `garmin`, bypassing garminconnect's `Garmin.login()` auto-pickup of the
+    GARMINTOKENS env var.
+
+    `Garmin.login(tokenstore=None)` does `tokenstore = tokenstore or
+    os.getenv("GARMINTOKENS")` - so whenever GARMINTOKENS is set in the
+    process environment (as it is on Fly, via fly.toml's [env] block), a
+    bare `garmin.login()` call *always* tries to load a saved session from
+    that directory instead of doing a fresh network login, even though the
+    caller's whole point was "no saved session yet, log in with credentials".
+    On a brand-new deploy with an empty volume that raises FileNotFoundError
+    looking for oauth1_token.json, because there is nothing to load yet.
+    Locally this never showed up, since GARMINTOKENS isn't exported as an
+    actual environment variable there (only main.py's own TOKENSTORE
+    fallback is), so the bug is Fly-only.
+
+    Temporarily hiding the env var for the duration of this one call sidesteps
+    it without touching garminconnect/garth themselves.
+    """
+    saved = os.environ.pop("GARMINTOKENS", None)
+    try:
+        garmin.login()
+    finally:
+        if saved is not None:
+            os.environ["GARMINTOKENS"] = saved
+
 
 # Optional shared-secret gate. Unset (the default local/dev setup) means every
 # route below stays exactly as open as it is today - localhost only, no key
@@ -96,7 +124,7 @@ def get_garmin_api(email: str = EMAIL, password: str = PASSWORD):
                     "Chrome/131.0.0.0 Safari/537.36"
                 )
             })
-            garmin.login()
+            _fresh_login(garmin)
             garmin.garth.dump(TOKENSTORE)
         except (FileNotFoundError, GarthHTTPError, GarminConnectAuthenticationError, GarminConnectConnectionError) as err:
             logger.error(err)
@@ -160,7 +188,7 @@ def _run_login(login_id: str, email: str, password: str) -> None:
     try:
         garmin = Garmin(email=email, password=password, is_cn=False, prompt_mfa=prompt_mfa)
         garmin.garth.sess.headers.update({"User-Agent": _DESKTOP_USER_AGENT})
-        garmin.login()
+        _fresh_login(garmin)
         garmin.garth.dump(TOKENSTORE)
         state["success"] = True
     except queue.Empty:
