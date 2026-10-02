@@ -1,0 +1,29 @@
+# Deploy with: fly deploy   (after `fly apps create` and `fly volumes create` - see ../DEPLOYMENT.md)
+app = "thirteen-nine-garmin-api"
+primary_region = "iad"
+
+[build]
+
+[env]
+  # Garmin session token lives on the mounted volume, not ephemeral
+  # container disk, so it survives restarts and auto-suspend/resume.
+  GARMINTOKENS = "/data/.garminconnect"
+  # Origin the packaged Android (Capacitor) app loads from.
+  ALLOWED_ORIGINS = "https://localhost"
+  # API_KEY is set separately as a secret (`fly secrets set API_KEY=...`),
+  # never committed here in plain text.
+
+[[mounts]]
+  source = "garmin_data"
+  destination = "/data"
+
+[http_service]
+  internal_port = 8081
+  force_https = true
+  auto_stop_machines = true
+  auto_start_machines = true
+  min_machines_running = 0
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"
