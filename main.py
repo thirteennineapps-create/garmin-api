@@ -34,14 +34,6 @@ ALLOWED_ORIGINS = (
     else _DEFAULT_ALLOWED_ORIGINS
 )
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
-    allow_credentials=True,
-    allow_methods=["GET", "POST"],
-    allow_headers=["*"],
-)
-
 @app.middleware("http")
 async def enforce_api_key(request, call_next):
     """When API_KEY is set (i.e. this instance is reachable beyond your own
@@ -52,6 +44,19 @@ async def enforce_api_key(request, call_next):
         if request.headers.get("x-api-key") != API_KEY:
             return JSONResponse(status_code=401, content={"detail": "Missing or invalid X-API-Key header."})
     return await call_next(request)
+
+# CORS must be added AFTER enforce_api_key: Starlette treats the last-added
+# middleware as the outermost one, so this way even the 401 above carries CORS
+# headers. Added first, a missing/wrong key made the browser (or Android
+# WebView) drop the 401 as an opaque network error, so the app only said
+# "can't reach the API" instead of showing the real problem.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["GET", "POST"],
+    allow_headers=["*"],
+)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
