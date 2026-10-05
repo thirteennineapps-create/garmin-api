@@ -112,6 +112,12 @@ to this setup:
   at the mounted volume - the Garmin session token survives restarts and
   auto-suspend/resume instead of being wiped like it would be on ephemeral
   container disk.
+- Sessions are per user: `POST /login` returns a random `session_id`, the
+  client sends it back as the `X-Session-Id` header, and each user's Garmin
+  tokens live under `$GARMINTOKENS/sessions/<sha256 of the id>/`. Every
+  data route (and `/auth_status`, `/logout`) acts only on the session it is
+  given; with no/unknown session they answer 401 "Not logged in to Garmin."
+  Passwords are never stored - only the OAuth tokens garth issues.
 - Fly terminates HTTPS for you (`force_https = true`), so the packaged
   Android app talks to a real `https://` endpoint - no cleartext
   workarounds needed.

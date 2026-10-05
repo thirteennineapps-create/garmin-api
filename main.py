@@ -1,11 +1,18 @@
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, Header
 from pydantic import BaseModel
+import asyncio
+import hashlib
 import os
 import datetime
 import logging
 import queue
+import re
+import secrets
+import shutil
 import threading
+import time
 import uuid
+from typing import Optional
 from garth.exc import GarthHTTPError
 from garminconnect import (
     Garmin,
@@ -63,8 +70,6 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Load environment variables if defined
-EMAIL = os.getenv("EMAIL")
-PASSWORD = os.getenv("PASSWORD")
 TOKENSTORE = os.getenv("GARMINTOKENS") or "~/.garminconnect"
 
 # Belt-and-suspenders: garth.dump() already creates this directory itself,
@@ -112,29 +117,73 @@ API_KEY = os.getenv("API_KEY")
 today = datetime.date.today()
 startdate = today - datetime.timedelta(days=7)
 
-# Dependency to initialize the Garmin API
-def get_garmin_api(email: str = EMAIL, password: str = PASSWORD):
+# ---------------------------------------------------------------------------
+# Per-user sessions
+#
+# Every user logs in with their own Garmin account. A successful login mints a
+# random session id (256 bits) that the app keeps and sends on each request as
+# `X-Session-Id`. That user's Garmin tokens are stored in their own directory
+# under TOKENSTORE/sessions/, named by a SHA-256 of the id so that listing the
+# directory on disk never reveals a usable id. Garmin passwords are never
+# stored - only the OAuth tokens garth issues.
+# ---------------------------------------------------------------------------
+_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{32,128}$")
+SESSIONS_DIR = os.path.join(os.path.expanduser(TOKENSTORE), "sessions")
+
+# Hosted setups (GARMINTOKENS set, e.g. on Fly) used to keep ONE shared login
+# at the top of TOKENSTORE. Nothing reads it any more, so remove the stale
+# tokens. Left alone when TOKENSTORE is just the default ~/.garminconnect,
+# which other garth-based tools on a dev machine may still use.
+if os.getenv("GARMINTOKENS"):
+    for _legacy in ("oauth1_token.json", "oauth2_token.json"):
+        try:
+            os.remove(os.path.join(os.path.expanduser(TOKENSTORE), _legacy))
+        except FileNotFoundError:
+            pass
+
+
+def _new_session_id() -> str:
+    return secrets.token_urlsafe(32)
+
+
+def _valid_session_id(session_id: Optional[str]) -> bool:
+    return bool(session_id) and bool(_SESSION_ID_RE.match(session_id))
+
+
+def _session_dir(session_id: str) -> str:
+    return os.path.join(SESSIONS_DIR, hashlib.sha256(session_id.encode()).hexdigest())
+
+
+def _http_status(err: Exception) -> Optional[int]:
+    resp = getattr(getattr(err, "error", None), "response", None)
+    return getattr(resp, "status_code", None)
+
+
+def _load_session(session_id: Optional[str]) -> "Garmin":
+    """Return a logged-in Garmin client for this session id, or raise 401.
+    The 401 details start with 'Not logged in' / 'Garmin session expired' so
+    the app can tell them apart from a bad X-API-Key."""
+    if not _valid_session_id(session_id) or not os.path.isdir(_session_dir(session_id)):
+        raise HTTPException(status_code=401, detail="Not logged in to Garmin.")
     try:
         garmin = Garmin()
-        garmin.login(TOKENSTORE)
-    except (FileNotFoundError, GarthHTTPError, GarminConnectAuthenticationError):
-        if not email or not password:
-            raise HTTPException(status_code=401, detail="Email and password are required")
-        try:
-            garmin = Garmin(email=email, password=password, is_cn=False)
-            garmin.garth.sess.headers.update({
-                "User-Agent": (
-                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/131.0.0.0 Safari/537.36"
-                )
-            })
-            _fresh_login(garmin)
-            garmin.garth.dump(TOKENSTORE)
-        except (FileNotFoundError, GarthHTTPError, GarminConnectAuthenticationError, GarminConnectConnectionError) as err:
-            logger.error(err)
-            raise HTTPException(status_code=500, detail="Failed to authenticate with Garmin Connect")
+        garmin.login(_session_dir(session_id))
+    except (FileNotFoundError, GarminConnectAuthenticationError):
+        raise HTTPException(status_code=401, detail="Garmin session expired - please log in again.")
+    except GarthHTTPError as err:
+        if _http_status(err) in (401, 403):
+            raise HTTPException(status_code=401, detail="Garmin session expired - please log in again.")
+        logger.error(err)
+        raise HTTPException(status_code=502, detail="Garmin Connect returned an error. Try again shortly.")
+    except GarminConnectConnectionError as err:
+        logger.error(err)
+        raise HTTPException(status_code=502, detail="Could not reach Garmin Connect. Try again shortly.")
     return garmin
+
+
+# Dependency: the Garmin client for whoever sent X-Session-Id
+def get_garmin_api(x_session_id: Optional[str] = Header(default=None)):
+    return _load_session(x_session_id)
 
 
 # ---------------------------------------------------------------------------
@@ -151,9 +200,8 @@ def get_garmin_api(email: str = EMAIL, password: str = PASSWORD):
 # API in this version of the library. To expose that over two separate
 # HTTP requests (submit credentials -> show an MFA field -> submit the
 # code), the login runs in a background thread and the callback blocks on
-# a queue that the second request pushes the code into. This process only
-# ever serves one local user, so a small in-memory dict keyed by a login
-# id is enough - no database needed.
+# a queue that the second request pushes the code into. Pending logins live
+# in a small in-memory dict keyed by a login id - no database needed.
 # ---------------------------------------------------------------------------
 
 _DESKTOP_USER_AGENT = (
@@ -194,7 +242,7 @@ def _run_login(login_id: str, email: str, password: str) -> None:
         garmin = Garmin(email=email, password=password, is_cn=False, prompt_mfa=prompt_mfa)
         garmin.garth.sess.headers.update({"User-Agent": _DESKTOP_USER_AGENT})
         _fresh_login(garmin)
-        garmin.garth.dump(TOKENSTORE)
+        garmin.garth.dump(_session_dir(state["session_id"]))
         state["success"] = True
     except queue.Empty:
         state["success"] = False
@@ -223,6 +271,7 @@ async def login(payload: LoginRequest):
         "done": threading.Event(),
         "success": None,
         "error": None,
+        "session_id": _new_session_id(),
     }
     with _pending_logins_lock:
         _pending_logins[login_id] = state
@@ -234,8 +283,13 @@ async def login(payload: LoginRequest):
 
     # Wait for whichever happens first: login finishes outright (no MFA
     # needed, or a fast credential failure), or garth asks for an MFA code.
-    mfa_needed = state["prompted"].wait(timeout=LOGIN_POLL_TIMEOUT_SECONDS)
+    # (Polling both events - waiting on just "prompted" made every non-MFA login
+    # sit out the whole timeout even though it had already finished.)
+    deadline = time.monotonic() + LOGIN_POLL_TIMEOUT_SECONDS
+    while not (state["done"].is_set() or state["prompted"].is_set()) and time.monotonic() < deadline:
+        await asyncio.sleep(0.05)
     done = state["done"].is_set()
+    mfa_needed = state["prompted"].is_set()
 
     if not done and mfa_needed:
         return {"status": "mfa_required", "login_id": login_id}
@@ -247,7 +301,7 @@ async def login(payload: LoginRequest):
     with _pending_logins_lock:
         _pending_logins.pop(login_id, None)
     if state["success"]:
-        return {"status": "ok"}
+        return {"status": "ok", "session_id": state["session_id"]}
     raise HTTPException(status_code=401, detail=state["error"] or "Login failed.")
 
 
@@ -268,19 +322,17 @@ async def login_mfa(payload: MfaRequest):
     if not finished:
         raise HTTPException(status_code=504, detail="Timed out waiting for Garmin to verify the MFA code.")
     if state["success"]:
-        return {"status": "ok"}
+        return {"status": "ok", "session_id": state["session_id"]}
     raise HTTPException(status_code=401, detail=state["error"] or "MFA verification failed.")
 
 
 @app.get("/auth_status")
-async def auth_status():
-    """Cheap check for whether a saved Garmin session already works, so the
-    frontend knows whether to show the login screen or go straight to the
-    dashboard - without needing credentials or triggering a fresh login."""
+async def auth_status(x_session_id: Optional[str] = Header(default=None)):
+    """Cheap check for whether this session (X-Session-Id) still has a working
+    Garmin login, so the app knows whether to show the login screen."""
     try:
-        garmin = Garmin()
-        garmin.login(TOKENSTORE)
-    except (FileNotFoundError, GarthHTTPError, GarminConnectAuthenticationError, GarminConnectConnectionError):
+        garmin = _load_session(x_session_id)
+    except HTTPException:
         return {"authenticated": False}
     except Exception:  # noqa: BLE001 - treat anything unexpected as "not logged in"
         return {"authenticated": False}
@@ -288,16 +340,12 @@ async def auth_status():
 
 
 @app.post("/logout")
-async def logout():
-    """Delete the saved session token so /auth_status goes back to False."""
-    token_path = os.path.expanduser(TOKENSTORE)
-    if os.path.isdir(token_path):
-        import shutil
-
-        shutil.rmtree(token_path, ignore_errors=True)
-    elif os.path.isfile(token_path):
-        os.remove(token_path)
+async def logout(x_session_id: Optional[str] = Header(default=None)):
+    """Delete this session's saved Garmin tokens (other users are untouched)."""
+    if _valid_session_id(x_session_id):
+        shutil.rmtree(_session_dir(x_session_id), ignore_errors=True)
     return {"status": "ok"}
+
 
 @app.get("/get_full_name")
 async def get_full_name(api: Garmin = Depends(get_garmin_api)):
